@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+.env
+.env.*
+
+# Nunca subir reportes de llamadas ni exportaciones (contienen datos personales)
+*.csv
+*.xlsx
+*.xls
