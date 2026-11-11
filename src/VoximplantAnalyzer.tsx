@@ -13,8 +13,23 @@ const KIT_LOGO = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADD
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pad2 = (n) => String(n).padStart(2, '0');
 
-// Convierte el valor de <input type="datetime-local"> (hora local) a 'YYYY-MM-DD HH:mm:ss' en UTC,
+// Convierte una fecha-hora local ('YYYY-MM-DDTHH:mm[:ss]') a 'YYYY-MM-DD HH:mm:ss' en UTC,
 // que es el formato exigido por la API de Kit.
+// Fecha local en formato YYYY-MM-DD
+const ymd = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const fmtDay = (s) => (s ? s.split('-').reverse().join('/') : '');
+
+// Rangos rápidos para la solicitud por API (días completos, hora local)
+export const DATE_PRESETS = [
+  { key: 'today', label: 'Hoy', range: (t) => [t, t] },
+  { key: 'yesterday', label: 'Ayer', range: (t) => [addDays(t, -1), addDays(t, -1)] },
+  { key: 'last7', label: 'Últimos 7 días', range: (t) => [addDays(t, -6), t] },
+  { key: 'last30', label: 'Últimos 30 días', range: (t) => [addDays(t, -29), t] },
+  { key: 'thisMonth', label: 'Este mes', range: (t) => [new Date(t.getFullYear(), t.getMonth(), 1), t] },
+  { key: 'lastMonth', label: 'Mes anterior', range: (t) => [new Date(t.getFullYear(), t.getMonth() - 1, 1), new Date(t.getFullYear(), t.getMonth(), 0)] },
+];
+
 export const toKitUtc = (localValue) => {
   const d = new Date(localValue);
   if (isNaN(d.getTime())) return null;
@@ -222,6 +237,7 @@ export const createProcessor = () => {
   let best = null;
   let dataRows = 0;
   let excluded = 0;
+  let duplicates = 0;
   const records = [];
   const seenSessions = new Set();
 
@@ -229,6 +245,13 @@ export const createProcessor = () => {
     dataRows++;
     const phone = cleanPhone(r[idx.phone]);
     if (!phone) { excluded++; return; }
+    // Una misma llamada (Session ID) puede aparecer en varias filas del reporte: se cuenta una sola vez
+    const sid = idx.sessionId >= 0 ? String(r[idx.sessionId] ?? '').trim() : '';
+    if (sid) {
+      const key = `${sid}\u0001${phone}`;
+      if (seenSessions.has(key)) { duplicates++; return; }
+      seenSessions.add(key);
+    }
     const { date, dt } = parseDateCell(r[idx.date]);
     const code = String(r[idx.resultCode] ?? '').trim();
     const att = parseInt(r[idx.attempt], 10);
@@ -306,6 +329,7 @@ export const createProcessor = () => {
         records,
         dataRows,
         excluded,
+        duplicates,
         hasAttemptNumbers: records.some((x) => x.attempt !== null),
         hasDirection: records.some((x) => x.direction),
       };
@@ -358,8 +382,11 @@ export const parseCsvFile = (file, onProgress) =>
  *  ANÁLISIS
  * ===================================================================== */
 
+// 'YYYY-MM-DD HH:mm' para mostrar
+const shortDt = (r) => (r.dt ? r.dt.slice(0, 16) : r.date) || 'N/A';
+
 // Agrupa por campaña + teléfono y calcula intentos y resultado del último intento
-export const analyzeRecords = (records, { campaign = '', direction = '', start = '', end = '', countMode = 'max' } = {}) => {
+export const analyzeRecords = (records, { campaign = '', direction = '', start = '', end = '' } = {}) => {
   const groups = new Map();
   for (const r of records) {
     if (campaign && r.campaign !== campaign) continue;
@@ -373,19 +400,21 @@ export const analyzeRecords = (records, { campaign = '', direction = '', start =
   }
   const out = [];
   for (const calls of groups.values()) {
-    calls.sort((a, b) => (a.attempt ?? 0) - (b.attempt ?? 0) || (a.dt < b.dt ? -1 : a.dt > b.dt ? 1 : 0));
+    // Orden cronológico (fecha y hora); a igual hora, por número de intento
+    calls.sort((a, b) => (a.dt < b.dt ? -1 : a.dt > b.dt ? 1 : 0) || (a.attempt ?? 0) - (b.attempt ?? 0));
     const last = calls[calls.length - 1];
     const maxAttempt = calls.reduce((m, c) => Math.max(m, c.attempt ?? 0), 0);
     out.push({
       phone: last.phone,
       campaign: last.campaign,
-      attempts: countMode === 'max' && maxAttempt > 0 ? maxAttempt : calls.length,
-      calls: calls.length,
+      attempts: calls.length, // total de intentos (llamadas únicas) del contacto en el reporte/filtros
+      maxAttemptNumber: maxAttempt || null,
       isSuccess: last.success,
       everSuccess: calls.some((c) => c.success),
       finalResponseCode: last.code,
-      firstCallDate: calls[0].date || 'N/A',
-      lastCallDate: last.date || 'N/A',
+      firstCallAt: shortDt(calls[0]),
+      lastCallAt: shortDt(last),
+      history: calls.map((c, i) => ({ n: i + 1, attempt: c.attempt, code: c.code, success: c.success, date: c.date, time: (c.dt || '').slice(11, 16), at: shortDt(c) })),
     });
   }
   return out;
@@ -427,7 +456,7 @@ const safeName = (s) => String(s || '').replace(/[^\w\-]+/g, '_').replace(/_+/g,
 const FORMAT_INFO = {
   kit: {
     title: 'Voximplant Kit — historial de llamadas',
-    note: 'Se usan las columnas Campaign name, Attempt number, Call result code y Phone B.',
+    note: 'Se usan las columnas Campaign name, Call result code, Date of call start y Phone B. Los intentos son el total de llamadas de cada contacto en el reporte (cada Session ID se cuenta una vez).',
   },
   platform: {
     title: 'Voximplant Platform — historial de llamadas (call_history)',
@@ -466,8 +495,13 @@ export default function VoximplantAnalyzer() {
   const [apiHost, setApiHost] = useState('');
   const [accountName, setAccountName] = useState('');
   const [accessToken, setAccessToken] = useState('');
-  const [apiFromDate, setApiFromDate] = useState('');
-  const [apiToDate, setApiToDate] = useState('');
+  // Rango de fechas: por defecto día completo (00:00 a 23:59:59, hora local)
+  const [apiFromDay, setApiFromDay] = useState(() => ymd(new Date()));
+  const [apiToDay, setApiToDay] = useState(() => ymd(new Date()));
+  const [apiPreset, setApiPreset] = useState('today');
+  const [useCustomTimes, setUseCustomTimes] = useState(false);
+  const [apiFromTime, setApiFromTime] = useState('00:00');
+  const [apiToTime, setApiToTime] = useState('23:59');
   const [apiLog, setApiLog] = useState([]);
   const [apiProxy, setApiProxy] = useState('');
 
@@ -481,7 +515,7 @@ export default function VoximplantAnalyzer() {
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const [exactAttempts, setExactAttempts] = useState('');
-  const [countMode, setCountMode] = useState('max'); // 'max' = Attempt number más alto | 'count' = llamadas registradas
+  const [expandedRow, setExpandedRow] = useState('');
 
   useEffect(() => {
     ensureXlsx().catch(() => {});
@@ -521,7 +555,7 @@ export default function VoximplantAnalyzer() {
     setStartDate('');
     setEndDate('');
     setExactAttempts('');
-    setCountMode(result.hasAttemptNumbers ? 'max' : 'count');
+    setExpandedRow('');
     if (result.records.length === 0) {
       throw new Error('El reporte se reconoció, pero no contiene llamadas con un número de teléfono válido.');
     }
@@ -583,18 +617,41 @@ export default function VoximplantAnalyzer() {
   //   POST https://{host}/api/v3/{método}?domain={account name}
   //   Cuerpo application/x-www-form-urlencoded con access_token y el resto de parámetros.
   const kitPost = (path, params = {}) =>
-    fetch(`${kitBaseUrl()}/${path}?${new URLSearchParams({ domain: accountName.trim() })}`, {
+    fetch(`${kitBaseUrl()}/${path}?${new URLSearchParams({ domain: cleanAccount() })}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         ...(proxyBase() ? { 'X-Kit-Host': kitHost() } : {}),
       },
-      body: new URLSearchParams({ access_token: accessToken.trim(), ...params }),
+      body: new URLSearchParams({ access_token: cleanToken(), ...params }),
     });
 
   const addLog = (msg) => setApiLog((prev) => [...prev, `${new Date().toLocaleTimeString()}  ${msg}`]);
 
-  const apiCredsMissing = () => !apiHost.trim() || !accountName.trim() || !accessToken.trim();
+  // El token no contiene espacios: se eliminan saltos de línea o espacios que se cuelan al copiar/pegar
+  const cleanToken = () => accessToken.replace(/\s+/g, '');
+  const cleanAccount = () => accountName.trim();
+  // Si solo se elige "Desde", se toma ese mismo día completo
+  const apiRangeLocal = () => {
+    const toDay = apiToDay || apiFromDay;
+    const fromTime = useCustomTimes ? (apiFromTime || '00:00') : '00:00';
+    const toTime = useCustomTimes ? (apiToTime || '23:59') : '23:59';
+    return {
+      startLocal: `${apiFromDay}T${fromTime}:00`,
+      endLocal: `${toDay}T${toTime}:59`,
+      label: `${fmtDay(apiFromDay)} ${fromTime} → ${fmtDay(toDay)} ${toTime}`,
+    };
+  };
+
+  const applyPreset = (preset) => {
+    const [a, b] = preset.range(new Date());
+    setApiFromDay(ymd(a));
+    setApiToDay(ymd(b));
+    setApiPreset(preset.key);
+    setUseCustomTimes(false);
+  };
+
+  const apiCredsMissing = () => !apiHost.trim() || !cleanAccount() || !cleanToken();
 
   // Flujo oficial (asíncrono):
   //   1. POST /api/v3/history/exportCallsHistoryReport (from, to en UTC 'YYYY-MM-DD HH:mm:ss') -> { success, result: { report_id } }
@@ -605,12 +662,13 @@ export default function VoximplantAnalyzer() {
   const handleApiFetch = async (e) => {
     if (e && e.preventDefault) e.preventDefault();
     setApiLog([]);
-    if (apiCredsMissing() || !apiFromDate || !apiToDate) {
+    if (apiCredsMissing() || !apiFromDay) {
       setError('Por favor completa todos los campos para realizar la petición.');
       return;
     }
-    const datetimeStart = toKitUtc(apiFromDate);
-    const datetimeEnd = toKitUtc(apiToDate);
+    const { startLocal, endLocal } = apiRangeLocal();
+    const datetimeStart = toKitUtc(startLocal);
+    const datetimeEnd = toKitUtc(endLocal);
     if (!datetimeStart || !datetimeEnd) {
       setError('Las fechas ingresadas no son válidas.');
       return;
@@ -628,6 +686,18 @@ export default function VoximplantAnalyzer() {
       // Se piden todas las llamadas (todas las direcciones y campañas); el filtrado se hace después en la app.
       // Parámetros documentados: from, to, format (xlsx|csv), locale (en|ru), call_direction (incoming|outgoing|all), call_status.
       const params = { from: datetimeStart, to: datetimeEnd, format: 'xlsx', locale: 'en', call_direction: 'all', call_status: 'true' };
+
+      // 0. Verificar credenciales con un método liviano (POST /api/v3/account/getAccountInfo)
+      addLog(`POST ${kitBaseUrl()}/account/getAccountInfo?domain=${cleanAccount()} · token de ${cleanToken().length} caracteres`);
+      try {
+        await readKitJson(await kitPost('account/getAccountInfo'));
+        addLog('Credenciales válidas');
+      } catch (credErr) {
+        if (/invalid credentials|401/i.test(credErr.message)) {
+          throw new Error(`Kit rechazó las credenciales ("${credErr.message}"). Revisa que el token sea el valor completo copiado con el ícono de copiar en Administración → Seguridad → API tokens (no el ID ni el nombre), que pertenezca a la cuenta "${cleanAccount()}", que esté activo y, si el token tiene restricción por IP, que tu IP actual esté autorizada`);
+        }
+        throw credErr;
+      }
 
       // 1. Iniciar la generación del reporte
       addLog(`exportCallsHistoryReport · from ${datetimeStart} · to ${datetimeEnd} (UTC)`);
@@ -676,9 +746,10 @@ export default function VoximplantAnalyzer() {
     } catch (err) {
       console.error(err);
       addLog(`Error: ${err.message}`);
+      const isCred = /rechazó las credenciales/.test(err.message);
       const isNetwork = /failed to fetch|networkerror|load failed/i.test(err.message);
       const nullOrigin = typeof window !== 'undefined' && window.location.origin === 'null';
-      let corsHint = ' Verifica el API Host, el Account Name y el Access Token.';
+      let corsHint = isCred ? '' : ' Verifica el API Host, el Account Name y el Access Token.';
       if (isNetwork && proxyBase()) {
         corsHint = ` No se pudo conectar con el proxy (${proxyBase()}). Verifica que esté en ejecución.`;
       } else if (isNetwork) {
@@ -696,8 +767,8 @@ export default function VoximplantAnalyzer() {
 
   // ---------- Análisis ----------
   const baseAnalyzedData = useMemo(
-    () => analyzeRecords(records, { campaign: selectedCampaign, direction: selectedDirection, start: startDate, end: endDate, countMode }),
-    [records, selectedCampaign, selectedDirection, startDate, endDate, countMode]
+    () => analyzeRecords(records, { campaign: selectedCampaign, direction: selectedDirection, start: startDate, end: endDate }),
+    [records, selectedCampaign, selectedDirection, startDate, endDate]
   );
 
   const distribution = useMemo(() => attemptsDistribution(baseAnalyzedData), [baseAnalyzedData]);
@@ -738,32 +809,42 @@ export default function VoximplantAnalyzer() {
     return parts.join('_');
   };
 
-  const DETAIL_HEADERS = ['Telefono', 'Campana', 'Intentos', 'Llamadas_registradas', 'Estado_ultimo_intento', 'Exito_en_algun_intento', 'Codigo_respuesta', 'Fecha_primer_intento', 'Fecha_ultimo_intento'];
-  const detailRow = (row) => [
-    row.phone, row.campaign, row.attempts, row.calls, row.isSuccess ? 'Exito' : 'Fallo',
-    row.everSuccess ? 'Si' : 'No', row.finalResponseCode, row.firstCallDate, row.lastCallDate,
+  // Hoja 1 "Contactos": una fila por contacto (campaña + teléfono), lista para filtrar
+  const CONTACT_HEADERS = ['Teléfono', 'Campaña', 'Total intentos', 'Cód. respuesta (última llamada)', 'Estado (última llamada)', 'Fecha y hora última llamada', 'Fecha y hora primer intento', 'Éxito en algún intento'];
+  const contactRow = (row) => [
+    row.phone, row.campaign, row.attempts, row.finalResponseCode, row.isSuccess ? 'Éxito' : 'Fallo',
+    row.lastCallAt, row.firstCallAt, row.everSuccess ? 'Sí' : 'No',
   ];
+  // Hoja 2 "Intentos": una fila por intento, en orden cronológico dentro de cada contacto
+  const ATTEMPT_HEADERS = ['Teléfono', 'Campaña', 'Total intentos', 'Intento', 'Fecha', 'Hora', 'Cód. respuesta', 'Resultado', 'Última llamada'];
+  const attemptRows = (row) => row.history.map((h) => [
+    row.phone, row.campaign, row.attempts, h.n, h.date, h.time, h.code, h.success ? 'Éxito' : 'Fallo', h.n === row.attempts ? 'Sí' : '',
+  ]);
 
-  // Excel: el teléfono se guarda como texto para no perder el '+' ni ceros a la izquierda
-  const downloadXlsx = (rows, onlyPhones, attempts = exactAttempts) => {
-    if (!window.XLSX || rows.length === 0) return;
-    const aoa = onlyPhones
-      ? [['Telefono'], ...rows.map((r) => [r.phone])]
-      : [DETAIL_HEADERS, ...rows.map(detailRow)];
-    const ws = window.XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols'] = aoa[0].map((_, i) => ({ wch: i === 1 && !onlyPhones ? 30 : 18 }));
-    const wb = window.XLSX.utils.book_new();
-    window.XLSX.utils.book_append_sheet(wb, ws, 'Contactos');
-    window.XLSX.writeFile(wb, `${exportBaseName(attempts)}${onlyPhones ? '_numeros' : ''}.xlsx`);
+  const makeSheet = (aoa, widths) => {
+    const XLSX = window.XLSX;
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = widths.map((wch) => ({ wch }));
+    ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: Math.max(aoa.length - 1, 0), c: aoa[0].length - 1 } }) };
+    return ws;
   };
 
-  const downloadCsv = (rows, onlyPhones) => {
+  // Excel con dos hojas. El teléfono se guarda como texto para no perder el '+' ni ceros a la izquierda.
+  const downloadXlsx = (rows, attempts = exactAttempts) => {
+    if (!window.XLSX || rows.length === 0) return;
+    const sorted = [...rows].sort((a, b) => a.campaign.localeCompare(b.campaign) || a.phone.localeCompare(b.phone));
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, makeSheet([CONTACT_HEADERS, ...sorted.map(contactRow)], [18, 30, 14, 28, 20, 24, 24, 20]), 'Contactos');
+    window.XLSX.utils.book_append_sheet(wb, makeSheet([ATTEMPT_HEADERS, ...sorted.flatMap(attemptRows)], [18, 30, 14, 9, 12, 8, 16, 11, 14]), 'Intentos');
+    window.XLSX.writeFile(wb, `${exportBaseName(attempts)}.xlsx`);
+  };
+
+  const downloadCsv = (rows) => {
     if (rows.length === 0) return;
-    const lines = onlyPhones
-      ? ['Telefono', ...rows.map((r) => csvCell(r.phone))]
-      : [DETAIL_HEADERS.join(','), ...rows.map((r) => detailRow(r).map(csvCell).join(','))];
-    const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
-    triggerDownload(blob, `${exportBaseName()}${onlyPhones ? '_numeros' : ''}.csv`);
+    const sorted = [...rows].sort((a, b) => a.campaign.localeCompare(b.campaign) || a.phone.localeCompare(b.phone));
+    const lines = [CONTACT_HEADERS.map(csvCell).join(','), ...sorted.map((r) => contactRow(r).map(csvCell).join(','))];
+    const blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    triggerDownload(blob, `${exportBaseName()}.csv`);
   };
 
   const fmt = (n) => Number(n).toLocaleString('es');
@@ -839,15 +920,45 @@ export default function VoximplantAnalyzer() {
                     <label className={labelCls}>Access token</label>
                     <input type="password" autoComplete="off" value={accessToken} onChange={(e) => setAccessToken(e.target.value)} className={inputCls} />
                   </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className={labelCls}>Desde</label>
-                      <input type="datetime-local" value={apiFromDate} onChange={(e) => setApiFromDate(e.target.value)} className={inputCls} />
+                  <div>
+                    <label className={labelCls}>Periodo</label>
+                    <div className="flex flex-wrap gap-2 mb-3">
+                      {DATE_PRESETS.map((p) => (
+                        <button key={p.key} type="button" onClick={() => applyPreset(p)}
+                          className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${apiPreset === p.key ? 'vx-bg vx-border text-white' : 'border-gray-300 text-gray-600 vx-hover-border vx-hover-text bg-white'}`}>
+                          {p.label}
+                        </button>
+                      ))}
                     </div>
-                    <div>
-                      <label className={labelCls}>Hasta</label>
-                      <input type="datetime-local" value={apiToDate} onChange={(e) => setApiToDate(e.target.value)} className={inputCls} />
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <span className="block text-xs text-gray-500 mb-1">Desde</span>
+                        <input type="date" value={apiFromDay} max={apiToDay || undefined}
+                          onChange={(e) => { setApiFromDay(e.target.value); setApiPreset(''); if (!apiToDay || e.target.value > apiToDay) setApiToDay(e.target.value); }}
+                          className={inputCls} />
+                      </div>
+                      <div>
+                        <span className="block text-xs text-gray-500 mb-1">Hasta</span>
+                        <input type="date" value={apiToDay} min={apiFromDay || undefined}
+                          onChange={(e) => { setApiToDay(e.target.value); setApiPreset(''); }}
+                          className={inputCls} />
+                      </div>
                     </div>
+                    <label className="flex items-center gap-2 text-xs text-gray-600 mt-3 cursor-pointer select-none">
+                      <input type="checkbox" checked={useCustomTimes} onChange={(e) => setUseCustomTimes(e.target.checked)} />
+                      Especificar horas (por defecto, días completos de 00:00 a 23:59)
+                    </label>
+                    {useCustomTimes && (
+                      <div className="grid grid-cols-2 gap-4 mt-2">
+                        <input type="time" value={apiFromTime} onChange={(e) => setApiFromTime(e.target.value)} className={inputCls} />
+                        <input type="time" value={apiToTime} onChange={(e) => setApiToTime(e.target.value)} className={inputCls} />
+                      </div>
+                    )}
+                    {apiFromDay && (
+                      <p className="text-xs text-gray-500 mt-2">
+                        Se pedirán las llamadas de <b className="text-gray-700">{apiRangeLocal().label}</b> (hora local).
+                      </p>
+                    )}
                   </div>
                   <div>
                     <label className={labelCls}>Proxy (opcional)</label>
@@ -905,6 +1016,7 @@ export default function VoximplantAnalyzer() {
                 <p className="mt-1 text-gray-500">
                   {fmt(dataset.dataRows)} {dataset.format === 'platform' ? 'sesiones' : 'llamadas'} leídas · {fmt(dataset.records.length)} analizadas
                   {dataset.excluded > 0 && ` · ${fmt(dataset.excluded)} sin teléfono identificable (excluidas)`}
+                  {dataset.duplicates > 0 && ` · ${fmt(dataset.duplicates)} ${dataset.duplicates === 1 ? 'fila repetida' : 'filas repetidas'} de la misma llamada (contadas una vez)`}
                   {dateBounds.min && ` · ${dateBounds.min} a ${dateBounds.max}`}
                 </p>
               </div>
@@ -947,19 +1059,6 @@ export default function VoximplantAnalyzer() {
                   ))}
                 </select>
               </div>
-              {dataset.hasAttemptNumbers && (
-                <div className="md:col-span-5 flex flex-wrap items-center gap-4 text-xs text-gray-600 border-t border-gray-100 pt-3">
-                  <span className="font-bold uppercase text-gray-500">Contar intentos por:</span>
-                  <label className="flex items-center gap-1 cursor-pointer">
-                    <input type="radio" checked={countMode === 'max'} onChange={() => setCountMode('max')} />
-                    Attempt number más alto (contador de Kit)
-                  </label>
-                  <label className="flex items-center gap-1 cursor-pointer">
-                    <input type="radio" checked={countMode === 'count'} onChange={() => setCountMode('count')} />
-                    Llamadas registradas en el reporte/rango
-                  </label>
-                </div>
-              )}
             </section>
 
             {/* Métricas */}
@@ -986,7 +1085,7 @@ export default function VoximplantAnalyzer() {
             <section className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
               <div className="p-4 border-b border-gray-200">
                 <h3 className="font-semibold text-gray-800">Contactos por cantidad de intentos</h3>
-                <p className="text-xs text-gray-500 mt-1">Haz clic en una fila para filtrar, o descarga directamente la lista de números de ese grupo.</p>
+                <p className="text-xs text-gray-500 mt-1">Total de intentos por contacto (campaña + teléfono). Haz clic en una fila para filtrar, o descarga la lista de ese grupo.</p>
               </div>
               <div className="overflow-x-auto vx-maxh-360">
                 <table className="w-full text-left border-collapse text-sm">
@@ -1017,7 +1116,7 @@ export default function VoximplantAnalyzer() {
                           <td className="px-4 py-2 text-right text-emerald-600">{fmt(d.success)}</td>
                           <td className="px-4 py-2 text-right">{((d.success / d.contacts) * 100).toFixed(1)}%</td>
                           <td className="px-4 py-2 text-right">
-                            <button onClick={(e) => { e.stopPropagation(); downloadXlsx(groupRows(), false, String(d.attempts)); }}
+                            <button onClick={(e) => { e.stopPropagation(); downloadXlsx(groupRows(), String(d.attempts)); }}
                               title={`Descargar los ${d.contacts} contactos con ${d.attempts} intentos`}
                               className="vx-text vx-hover-soft rounded p-1">
                               <Download className="w-4 h-4" />
@@ -1038,18 +1137,15 @@ export default function VoximplantAnalyzer() {
                   <h3 className="font-semibold text-gray-800">
                     {exactAttempts !== '' ? `Contactos con exactamente ${exactAttempts} ${exactAttempts === '1' ? 'intento' : 'intentos'}` : 'Resultados por contacto'}
                   </h3>
-                  <p className="text-xs text-gray-500 mt-1">{fmt(processedData.length)} contactos{selectedDirection ? ` · ${selectedDirection}` : ''}{selectedCampaign ? ` · ${selectedCampaign}` : ''}</p>
+                  <p className="text-xs text-gray-500 mt-1">{fmt(processedData.length)} {processedData.length === 1 ? 'contacto' : 'contactos'}{selectedDirection ? ` · ${selectedDirection}` : ''}{selectedCampaign ? ` · ${selectedCampaign}` : ''}</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <button onClick={() => downloadXlsx(processedData, true)} disabled={processedData.length === 0}
+                  <button onClick={() => downloadXlsx(processedData)} disabled={processedData.length === 0}
+                    title="Hoja Contactos (una fila por contacto) + hoja Intentos (cada intento con fecha, hora y código)"
                     className="vx-bg vx-bg-hover text-white px-4 py-2 text-sm font-medium rounded transition-colors flex items-center disabled:opacity-50">
                     <Download className="w-4 h-4 mr-2" /> Lista de números (.xlsx)
                   </button>
-                  <button onClick={() => downloadXlsx(processedData, false)} disabled={processedData.length === 0}
-                    className="bg-gray-100 hover:bg-gray-200 text-gray-800 px-4 py-2 text-sm font-medium rounded transition-colors flex items-center disabled:opacity-50">
-                    <Download className="w-4 h-4 mr-2" /> Detalle (.xlsx)
-                  </button>
-                  <button onClick={() => downloadCsv(processedData, false)} disabled={processedData.length === 0}
+                  <button onClick={() => downloadCsv(processedData)} disabled={processedData.length === 0}
                     className="bg-gray-100 hover:bg-gray-200 text-gray-800 px-4 py-2 text-sm font-medium rounded transition-colors flex items-center disabled:opacity-50">
                     <Download className="w-4 h-4 mr-2" /> CSV
                   </button>
@@ -1062,10 +1158,10 @@ export default function VoximplantAnalyzer() {
                     <tr>
                       <th className="px-6 py-3 border-b border-gray-200">Teléfono</th>
                       <th className="px-6 py-3 border-b border-gray-200">Campaña</th>
-                      <th className="px-6 py-3 border-b border-gray-200 text-center">Intentos</th>
-                      <th className="px-6 py-3 border-b border-gray-200 text-center">Cód. respuesta</th>
-                      <th className="px-6 py-3 border-b border-gray-200 text-center">Último intento</th>
-                      <th className="px-6 py-3 border-b border-gray-200 text-center">Estado</th>
+                      <th className="px-6 py-3 border-b border-gray-200 text-center">Total intentos</th>
+                      <th className="px-6 py-3 border-b border-gray-200 text-center">Cód. respuesta<span className="block normal-case font-normal">(última llamada)</span></th>
+                      <th className="px-6 py-3 border-b border-gray-200 text-center">Última llamada</th>
+                      <th className="px-6 py-3 border-b border-gray-200 text-center">Estado<span className="block normal-case font-normal">(última llamada)</span></th>
                     </tr>
                   </thead>
                   <tbody className="text-sm text-gray-700 divide-y divide-gray-100">
@@ -1074,15 +1170,20 @@ export default function VoximplantAnalyzer() {
                         <td colSpan={6} className="px-6 py-12 text-center text-gray-500">No hay resultados con estos filtros.</td>
                       </tr>
                     ) : (
-                      processedData.slice(0, 100).map((row) => (
-                        <tr key={`${row.campaign}|${row.phone}`} className="hover:bg-gray-50 transition-colors">
-                          <td className="px-6 py-3 font-medium font-mono">{row.phone}</td>
+                      processedData.slice(0, 100).map((row) => {
+                        const rowKey = `${row.campaign}|${row.phone}`;
+                        const open = expandedRow === rowKey;
+                        return (
+                        <React.Fragment key={rowKey}>
+                        <tr onClick={() => setExpandedRow(open ? '' : rowKey)} title="Ver cada intento"
+                          className={`cursor-pointer transition-colors ${open ? 'vx-bg-soft' : 'hover:bg-gray-50'}`}>
+                          <td className="px-6 py-3 font-medium font-mono"><span className="text-gray-400 mr-1">{open ? '▾' : '▸'}</span>{row.phone}</td>
                           <td className="px-6 py-3 text-gray-500 truncate max-w-xs" title={row.campaign}>{row.campaign}</td>
                           <td className="px-6 py-3 text-center">
                             <span className="inline-block bg-gray-100 rounded-full px-2 py-0.5 text-xs font-bold">{row.attempts}</span>
                           </td>
                           <td className="px-6 py-3 text-center font-mono">{row.finalResponseCode}</td>
-                          <td className="px-6 py-3 text-center text-gray-500">{row.lastCallDate}</td>
+                          <td className="px-6 py-3 text-center text-gray-500 whitespace-nowrap">{row.lastCallAt}</td>
                           <td className="px-6 py-3 text-center">
                             {row.isSuccess ? (
                               <span className="text-emerald-600 font-bold flex items-center justify-center"><CheckCircle2 className="w-4 h-4 mr-1" /> Éxito</span>
@@ -1091,7 +1192,37 @@ export default function VoximplantAnalyzer() {
                             )}
                           </td>
                         </tr>
-                      ))
+                        {open && (
+                          <tr className="vx-bg-soft">
+                            <td colSpan={6} className="px-6 pb-4 pt-1">
+                              <table className="text-xs bg-white border border-gray-200 rounded w-full max-w-lg">
+                                <thead className="text-gray-500 uppercase">
+                                  <tr>
+                                    <th className="px-3 py-1.5 text-left">Intento</th>
+                                    <th className="px-3 py-1.5 text-left">Fecha</th>
+                                    <th className="px-3 py-1.5 text-left">Hora</th>
+                                    <th className="px-3 py-1.5 text-left">Cód. respuesta</th>
+                                    <th className="px-3 py-1.5 text-left">Resultado</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-100">
+                                  {row.history.map((h) => (
+                                    <tr key={h.n}>
+                                      <td className="px-3 py-1.5 font-bold">{h.n}</td>
+                                      <td className="px-3 py-1.5">{h.date}</td>
+                                      <td className="px-3 py-1.5">{h.time}</td>
+                                      <td className="px-3 py-1.5 font-mono">{h.code}</td>
+                                      <td className={`px-3 py-1.5 font-medium ${h.success ? 'text-emerald-600' : 'text-red-500'}`}>{h.success ? 'Éxito' : 'Fallo'}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </td>
+                          </tr>
+                        )}
+                        </React.Fragment>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
